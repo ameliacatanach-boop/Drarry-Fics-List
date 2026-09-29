@@ -53,6 +53,8 @@ const DNR_LEGACY_CONTENT_TAGS=10, DNR_LEGACY_CONTENT_CAT=12;
 const STATUS_CODE_MAP = { '': 0, 'Read': 1, 'DNF': 2, 'Skipped': 3, 'Not Interested': 4, 'Currently Reading': 5, 'TBR': 6 };
 const DNR_CODE_MAP = { '': 0, 'Writing/Pacing': 1, 'Content': 2, 'Other': 3, 'Content/Tags': 10, 'Content/Category': 12 };
 
+const ENJOYMENT_MULTIPLIER = { 0: 1, 1: 0.25, 2: 0.6, 3: 1, 4: 1.5, 5: 2 };
+
 const COLORS = {
   paper: '#EFEAE0', paperCard: '#FFFFFF', ink: '#231F20', inkSoft: '#75706A',
   maroon: '#7A1F1F', maroonDark: '#5C1616', gold: '#9C7A3C', line: '#DCD4C4',
@@ -155,6 +157,8 @@ function ficFromRow(headerIndex, row, rowNumber) {
   const dnrTagsRaw = get('DNR Tags').trim();
   const dnrTags = dnrTagsRaw ? dnrTagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [];
   const dnrCategory = get('DNR Category').trim().toUpperCase() === 'Y';
+  const enjoymentRaw = parseInt(get('Enjoyment').trim(), 10);
+  const enjoyment = (enjoymentRaw >= 1 && enjoymentRaw <= 5) ? enjoymentRaw : 0;
   const num = (v) => { const n = parseInt(String(v).replace(/,/g, ''), 10); return isNaN(n) ? 0 : n; };
 
   return {
@@ -176,6 +180,7 @@ function ficFromRow(headerIndex, row, rowNumber) {
     status: STATUS_CODE_MAP[get('Status').trim()] ?? 0,
     dnr: DNR_CODE_MAP[get('DNR Reason').trim()] ?? 0,
     dnrTags, dnrCategory,
+    enjoyment,
     kg: get('K').trim().toUpperCase() === 'Y',
     bk: get('B').trim().toUpperCase() === 'Y',
     recommended: get('Recommended').trim().toUpperCase() === 'Y',
@@ -242,7 +247,7 @@ async function sheetsApiWriteCell(accessToken, rowNumber, colLetterVal, value) {
   }
 }
 
-async function sheetsApiWriteStatus(accessToken, rowNumber, { status, dnr, kg, bk, dnrTags, dnrCategory }, dnrTagsCol, dnrCategoryCol) {
+async function sheetsApiWriteStatus(accessToken, rowNumber, { status, dnr, kg, bk, dnrTags, dnrCategory, enjoyment }, dnrTagsCol, dnrCategoryCol, enjoymentCol) {
   const range = encodeURIComponent(`'${SHEET_TAB}'!B${rowNumber}:E${rowNumber}`);
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?valueInputOption=USER_ENTERED`;
   const statusLabel = status === STATUS_UNREAD ? '' : STATUS_LABELS[status];
@@ -264,6 +269,9 @@ async function sheetsApiWriteStatus(accessToken, rowNumber, { status, dnr, kg, b
   if (dnrCategoryCol) {
     await sheetsApiWriteCell(accessToken, rowNumber, dnrCategoryCol, dnrCategory ? 'Y' : '');
   }
+  if (enjoymentCol) {
+    await sheetsApiWriteCell(accessToken, rowNumber, enjoymentCol, (status === STATUS_READ && enjoyment) ? String(enjoyment) : '');
+  }
 }
 
 async function sheetsApiWriteRecommendation(accessToken, rowNumber, { recommended, recSource }, recCol, recSourceCol) {
@@ -282,6 +290,7 @@ function useSheetFics(accessToken, onAuthError) {
   const ficsRef = useRef([]);
   const dnrTagsColRef = useRef(null);
   const dnrCategoryColRef = useRef(null);
+  const enjoymentColRef = useRef(null);
   const recColRef = useRef(null);
   const recSourceColRef = useRef(null);
   useEffect(() => { ficsRef.current = fics; }, [fics]);
@@ -298,6 +307,7 @@ function useSheetFics(accessToken, onAuthError) {
       header.forEach((h, i) => { headerIndex[h.trim()] = i; });
       dnrTagsColRef.current = headerIndex['DNR Tags'] !== undefined ? colLetter(headerIndex['DNR Tags']) : null;
       dnrCategoryColRef.current = headerIndex['DNR Category'] !== undefined ? colLetter(headerIndex['DNR Category']) : null;
+      enjoymentColRef.current = headerIndex['Enjoyment'] !== undefined ? colLetter(headerIndex['Enjoyment']) : null;
       recColRef.current = headerIndex['Recommended'] !== undefined ? colLetter(headerIndex['Recommended']) : null;
       recSourceColRef.current = headerIndex['Rec Source'] !== undefined ? colLetter(headerIndex['Rec Source']) : null;
       const parsedFics = [];
@@ -328,7 +338,7 @@ function useSheetFics(accessToken, onAuthError) {
 
     try {
       const merged = { ...prevFic, ...patch };
-      await sheetsApiWriteStatus(accessToken, merged.rowNumber, merged, dnrTagsColRef.current, dnrCategoryColRef.current);
+      await sheetsApiWriteStatus(accessToken, merged.rowNumber, merged, dnrTagsColRef.current, dnrCategoryColRef.current, enjoymentColRef.current);
       setFics(prev => prev.map(f => f.id === ficId ? { ...f, syncState: 'idle' } : f));
     } catch (e) {
       setFics(prev => prev.map(f => f.id === ficId ? { ...prevFic, syncState: 'error', syncError: e.message || String(e), syncType: 'status' } : f));
@@ -342,7 +352,7 @@ function useSheetFics(accessToken, onAuthError) {
     if (fic.syncType === 'recommendation') {
       updateRecommendation(ficId, { recommended: fic.recommended, recSource: fic.recSource });
     } else {
-      updateFic(ficId, { status: fic.status, dnr: fic.dnr, kg: fic.kg, bk: fic.bk, dnrTags: fic.dnrTags, dnrCategory: fic.dnrCategory });
+      updateFic(ficId, { status: fic.status, dnr: fic.dnr, kg: fic.kg, bk: fic.bk, dnrTags: fic.dnrTags, dnrCategory: fic.dnrCategory, enjoyment: fic.enjoyment });
     }
   }, [updateFic]);
 
@@ -464,7 +474,10 @@ function useComputedScores(fics) {
         const w = 1 + 0.5 * (kg[i] ? 1 : 0) + 1 * (bk[i] ? 1 : 0);
         for (const t of f.tags) bump(tagStats, t, 'readW', w);
         bump(catStats, f.category, 'readW', w);
-        for (const a of realAuthors(f)) bump(authorStats, a, 'readW', w);
+        // Enjoyment (1-5, optional) only scales the author's signal — tags and
+        // category keep using the plain kudos/bookmark weight regardless of rating.
+        const authorW = w * (ENJOYMENT_MULTIPLIER[f.enjoyment] ?? 1);
+        for (const a of realAuthors(f)) bump(authorStats, a, 'readW', authorW);
       } else if (s === STATUS_DNF) {
         const targets = contentPenaltyTargets(f, d);
         for (const t of targets.tags) bump(tagStats, t, 'dnf', 1);
@@ -547,19 +560,21 @@ function Chip({ active, onClick, children, color }) {
   );
 }
 
-function StatusPicker({ ficId, status, dnr, dnrTags, dnrCategory, kg, bk, tags, category, onUpdate }) {
+function StatusPicker({ ficId, status, dnr, dnrTags, dnrCategory, enjoyment, kg, bk, tags, category, onUpdate }) {
   const [pendingStatus, setPendingStatus] = useState(null);
   const [pendingDnrCode, setPendingDnrCode] = useState(null);
   const [pickedDnrTags, setPickedDnrTags] = useState([]);
   const [pickedDnrCategory, setPickedDnrCategory] = useState(false);
+  const [pendingRating, setPendingRating] = useState(0);
 
   const setStatus = (s) => {
     setPendingDnrCode(null);
-    if (s === STATUS_READ) setPendingStatus(STATUS_READ);
+    if (s === STATUS_READ) { setPendingRating(enjoyment || 0); setPendingStatus(STATUS_READ); }
     else if (s === STATUS_DNF || s === STATUS_NOTINT) setPendingStatus(s);
-    else { onUpdate(ficId, { status: s, dnr: 0, dnrTags: [], dnrCategory: false }); setPendingStatus(null); }
+    else { onUpdate(ficId, { status: s, dnr: 0, dnrTags: [], dnrCategory: false, enjoyment: 0 }); setPendingStatus(null); }
   };
-  const confirmRead = (kgVal, bkVal) => { onUpdate(ficId, { status: STATUS_READ, kg: kgVal, bk: bkVal }); setPendingStatus(null); };
+  const toggleRating = (n) => setPendingRating(prev => prev === n ? 0 : n);
+  const confirmRead = (kgVal, bkVal) => { onUpdate(ficId, { status: STATUS_READ, kg: kgVal, bk: bkVal, enjoyment: pendingRating }); setPendingStatus(null); };
   const confirmDnr = (reasonCode) => {
     if (reasonCode === DNR_CONTENT) {
       setPendingDnrCode(reasonCode);
@@ -586,7 +601,22 @@ function StatusPicker({ ficId, status, dnr, dnrTags, dnrCategory, kg, bk, tags, 
       </div>
       {pendingStatus === STATUS_READ && (
         <div className="mt-2 p-3 rounded-lg" style={{ backgroundColor: COLORS.paper }}>
-          <p className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Left kudos? Bookmarked?</p>
+          <p className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Enjoyment (writing and overall, optional)</p>
+          <div className="flex gap-2">
+            {[1, 2, 3, 4, 5].map(n => (
+              <button key={n} onClick={() => toggleRating(n)} aria-label={`Enjoyment ${n} of 5`}
+                className="flex-1 text-base font-semibold rounded-full"
+                style={{ minHeight: 44, border: `1px solid ${pendingRating === n ? COLORS.ink : COLORS.line}`, backgroundColor: pendingRating === n ? COLORS.ink : COLORS.paperCard, color: pendingRating === n ? COLORS.paperCard : COLORS.ink }}>
+                {n}
+              </button>
+            ))}
+          </div>
+          <div className="grid grid-cols-3 mt-1.5 text-[11px]" style={{ color: COLORS.inkSoft }}>
+            <span className="text-left">1 · didn't enjoy it</span>
+            <span className="text-center">3 · neutral</span>
+            <span className="text-right">5 · loved it</span>
+          </div>
+          <p className="text-xs font-medium mb-2 mt-3.5" style={{ color: COLORS.inkSoft }}>Left kudos? Bookmarked?</p>
           <div className="flex gap-2 flex-wrap">
             {[[false, false, 'Neither'], [true, false, 'Kudos'], [false, true, 'Bookmarked'], [true, true, 'Both']].map(([kv, bv, label]) => (
               <button key={label} onClick={() => confirmRead(kv, bv)} className="text-sm px-3 py-2 rounded-full border font-medium" style={{ borderColor: COLORS.line, backgroundColor: COLORS.paperCard, color: COLORS.ink }}>{label}</button>
@@ -637,7 +667,7 @@ function StatusPicker({ ficId, status, dnr, dnrTags, dnrCategory, kg, bk, tags, 
       )}
       {status !== STATUS_UNREAD && pendingStatus === null && (
         <p className="text-[11px] mt-1.5" style={{ color: COLORS.inkSoft }}>
-          {status === STATUS_READ && `Kudos: ${kg ? 'Yes' : 'No'} · Bookmarked: ${bk ? 'Yes' : 'No'}`}
+          {status === STATUS_READ && `Kudos: ${kg ? 'Yes' : 'No'} · Bookmarked: ${bk ? 'Yes' : 'No'}${enjoyment ? ` · Enjoyment: ${enjoyment}/5` : ''}`}
           {(status === STATUS_DNF || status === STATUS_NOTINT) && dnr > 0 && (() => {
             if (dnr === DNR_CONTENT) {
               const parts = [];
@@ -773,7 +803,7 @@ function FicCard({ fic, scores, ficIndex, onUpdate, onRetry, onUpdateRecommendat
       </div>
 
       {expanded && (
-        <StatusPicker ficId={fic.id} status={status} dnr={scores.dnr[ficIndex]} dnrTags={fic.dnrTags} dnrCategory={fic.dnrCategory} kg={scores.kg[ficIndex]} bk={scores.bk[ficIndex]} tags={fic.tags} category={fic.category} onUpdate={onUpdate} />
+        <StatusPicker ficId={fic.id} status={status} dnr={scores.dnr[ficIndex]} dnrTags={fic.dnrTags} dnrCategory={fic.dnrCategory} enjoyment={fic.enjoyment} kg={scores.kg[ficIndex]} bk={scores.bk[ficIndex]} tags={fic.tags} category={fic.category} onUpdate={onUpdate} />
       )}
     </div>
   );
